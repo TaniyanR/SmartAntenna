@@ -32,7 +32,7 @@ function sa_security_headers(): void {
     header('X-Content-Type-Options: nosniff');
     header('Referrer-Policy: strict-origin-when-cross-origin');
     header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
-    header("Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'");
+    header("Content-Security-Policy: default-src 'self' https:; img-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; frame-src https:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'");
 }
 sa_security_headers();
 
@@ -218,8 +218,9 @@ function sa_cleanup_expired(): void {
     $ret=(string)sa_setting('article_retention','unlimited');
     if ($ret==='unlimited') return;
     $years=max(1,(int)$ret);
-    $st=sa_db()->prepare("UPDATE articles SET is_deleted=1,deleted_reason='期限切れ',deleted_at=NOW() WHERE is_deleted=0 AND COALESCE(published_at,created_at)<DATE_SUB(NOW(),INTERVAL ? YEAR)");
-    $st->execute([$years]);
+    $cutoff=date('Y-m-d H:i:s',strtotime('-'.$years.' years'));
+    $st=sa_db()->prepare("UPDATE articles SET is_deleted=1,deleted_reason='期限切れ',deleted_at=NOW() WHERE is_deleted=0 AND COALESCE(published_at,created_at)<?");
+    $st->execute([$cutoff]);
 }
 
 function sa_maybe_refresh(): void {
@@ -267,6 +268,22 @@ function sa_ref_excluded(string $ref): bool {
     return false;
 }
 
+function sa_is_suspicious(string $kind): int {
+    $ua=sa_ua();
+    if ($ua==='' || preg_match('/(?:curl|wget|python|scrapy|httpclient|headless)/i',$ua)) return 1;
+    try {
+        $table=$kind==='out'?'access_out':($kind==='pv'?'article_pv':'access_in');
+        $st=sa_db()->prepare("SELECT COUNT(*) FROM {$table} WHERE ip_hash=? AND created_at>=DATE_SUB(NOW(),INTERVAL 1 MINUTE)");
+        $st->execute([sa_ip_hash()]);
+        return (int)$st->fetchColumn()>120 ? 1 : 0;
+    } catch(Throwable) { return 0; }
+}
+function sa_rate_limit(string $key,int $seconds=30): bool {
+    $k='rate_'.$key; $last=(int)($_SESSION[$k]??0);
+    if(time()-$last<$seconds) return false;
+    $_SESSION[$k]=time(); return true;
+}
+
 function sa_track_in(): void {
     $ref=(string)($_SERVER['HTTP_REFERER'] ?? '');
     $self=strtolower((string)parse_url(sa_env('APP_URL',''),PHP_URL_HOST));
@@ -277,27 +294,27 @@ function sa_track_in(): void {
     $ip=sa_ip_hash(); $ua=sa_ua_hash();
     $st=sa_db()->prepare('SELECT 1 FROM access_in WHERE ip_hash=? AND ua_hash=? AND ((site_id IS NULL AND ? IS NULL) OR site_id=?) AND created_at>=DATE_SUB(NOW(),INTERVAL 12 HOUR) LIMIT 1');
     $st->execute([$ip,$ua,$siteId,$siteId]); if ($st->fetchColumn()) return;
-    $st=sa_db()->prepare('INSERT INTO access_in(site_id,ref_host,ref_url,ip_hash,ua_hash,is_direct,is_fraud) VALUES(?,?,?,?,?,?,0)');
-    $st->execute([$siteId,$direct?'Direct / Bookmark':$refHost,$ref?:null,$ip,$ua,$direct]);
+    $st=sa_db()->prepare('INSERT INTO access_in(site_id,ref_host,ref_url,ip_hash,ua_hash,is_direct,is_fraud) VALUES(?,?,?,?,?,?,?)');
+    $st->execute([$siteId,$direct?'Direct / Bookmark':$refHost,$ref?:null,$ip,$ua,$direct,sa_is_suspicious('in')]);
 }
 
 function sa_track_pv(int $articleId): void {
     $ip=sa_ip_hash(); $ua=sa_ua_hash();
     $st=sa_db()->prepare('SELECT 1 FROM article_pv WHERE article_id=? AND ip_hash=? AND ua_hash=? AND created_at>=DATE_SUB(NOW(),INTERVAL 30 SECOND)');
     $st->execute([$articleId,$ip,$ua]); if($st->fetchColumn()) return;
-    $st=sa_db()->prepare('INSERT INTO article_pv(article_id,ip_hash,ua_hash) VALUES(?,?,?)'); $st->execute([$articleId,$ip,$ua]);
+    $st=sa_db()->prepare('INSERT INTO article_pv(article_id,ip_hash,ua_hash,is_fraud) VALUES(?,?,?,?)'); $st->execute([$articleId,$ip,$ua,sa_is_suspicious('pv')]);
 }
 function sa_track_out(array $article): void {
     $ip=sa_ip_hash(); $ua=sa_ua_hash();
     $st=sa_db()->prepare('SELECT 1 FROM access_out WHERE article_id=? AND ip_hash=? AND ua_hash=? AND created_at>=DATE_SUB(NOW(),INTERVAL 5 MINUTE)');
     $st->execute([$article['id'],$ip,$ua]); if(!$st->fetchColumn()) {
-        $st=sa_db()->prepare('INSERT INTO access_out(article_id,site_id,ip_hash,ua_hash) VALUES(?,?,?,?)');
-        $st->execute([$article['id'],$article['site_id'],$ip,$ua]);
+        $st=sa_db()->prepare('INSERT INTO access_out(article_id,site_id,ip_hash,ua_hash,is_fraud) VALUES(?,?,?,?,?)');
+        $st->execute([$article['id'],$article['site_id'],$ip,$ua,sa_is_suspicious('out')]);
     }
 }
 
 function sa_article(int $id): ?array {
-    $st=sa_db()->prepare('SELECT a.*,s.name site_name,c.name category_name,c.slug category_slug FROM articles a JOIN sites s ON s.id=a.site_id LEFT JOIN categories c ON c.id=a.category_id WHERE a.id=?');
+    $st=sa_db()->prepare('SELECT a.*,s.name site_name,s.status site_status,c.name category_name,c.slug category_slug FROM articles a JOIN sites s ON s.id=a.site_id LEFT JOIN categories c ON c.id=a.category_id WHERE a.id=?');
     $st->execute([$id]); $r=$st->fetch(); return $r?:null;
 }
 function sa_articles(string $where='1=1', array $params=[], int $limit=50): array {
@@ -312,6 +329,11 @@ function sa_rank_articles(string $key,int $limit=20): array {
     $st=sa_db()->prepare("SELECT a.*,s.name site_name FROM articles a JOIN sites s ON s.id=a.site_id WHERE a.is_deleted=0 AND a.id IN ($ph)");
     $st->execute($ids); $rows=$st->fetchAll(); $map=[]; foreach($rows as $r)$map[(int)$r['id']]=$r;
     $out=[]; foreach($ids as $id) if(isset($map[$id]))$out[]=$map[$id]; return $out;
+}
+
+function sa_preferred_articles(int $limit=3): array {
+    $st=sa_db()->prepare("SELECT a.*,s.name site_name FROM sites s JOIN articles a ON a.site_id=s.id WHERE s.status='active' AND s.is_preferred=1 AND a.is_deleted=0 ORDER BY COALESCE(s.preferred_position,99),COALESCE(a.published_at,a.created_at) DESC LIMIT ".max(1,min(3,$limit)));
+    $st->execute(); return $st->fetchAll();
 }
 
 function sa_admin_logged_in(): bool { return !empty($_SESSION['admin_id']); }
